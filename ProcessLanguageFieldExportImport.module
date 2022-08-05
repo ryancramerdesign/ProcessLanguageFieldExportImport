@@ -1,0 +1,840 @@
+<?php namespace ProcessWire;
+
+/**
+ * Language Field Export/Import
+ * 
+ * Enables export and import of multi-language field values on pages.
+ * 
+ * ProcessWire 3.x, Copyright 2022 by Ryan Cramer
+ * https://processwire.com
+ * 
+ * @property string $clientKey Client key to enable client-specific features when necessary (i.e. "updateag" is one)
+ * 
+ */ 
+class ProcessLanguageFieldExportImport extends Process implements ConfigurableModule {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Language field translations export/import',
+			'summary' => 'Enables export and import of multi-language field translations on pages.',
+			'icon' => 'language',
+			'version' => 10,
+			'author' => 'Ryan Cramer',
+			'requires' => 'LanguageSupport',
+			'permission' => 'lang-fields-export-import',
+			'permissions' => array(
+				'lang-fields-export-import' => 'Import or export multi-language field translations for pages',
+			),
+			'page' => array(
+				'name' => 'lang-fields-export-import',
+				'parent' => 'setup',
+				'title' => 'Translation export/import',
+			)
+		);
+	}
+
+	/**
+	 * @var LanguageFieldExporter|null
+	 * 
+	 */
+	protected $exporter = null;
+	
+	/**
+	 * @var LanguageFieldImporter|null
+	 *
+	 */
+	protected $importer = null;
+
+	/**
+	 * Construct
+	 * 
+	 */
+	public function __construct() {
+		parent::__construct();
+		$this->set('clientKey', '');
+	}
+
+	/**
+	 * @return LanguageFieldExporter
+	 *
+	 */
+	public function exporter() {
+		if($this->exporter === null) {
+			require(__DIR__ . '/LanguageFieldExporter.php');
+			$this->exporter = new LanguageFieldExporter();
+			$this->wire($this->exporter);
+		}
+		return $this->exporter;
+	}
+	
+	/**
+	 * @return LanguageFieldImporter
+	 *
+	 */
+	public function importer() {
+		if($this->importer === null) {
+			require(__DIR__ . '/LanguageFieldImporter.php');
+			$this->importer = new LanguageFieldImporter();
+			$this->wire($this->importer);
+		}
+		return $this->importer;
+	}
+	
+	public function wired() {
+		$this->exporter();
+		$this->importer();
+		parent::wired();
+	}
+
+	/**
+	 * Primary export form
+	 * 
+	 * @return string
+	 * 
+	 */
+	public function execute() {
+		
+		$modules = $this->wire()->modules;
+		$input = $this->wire()->input;
+		$js = 'script';
+		
+		$modules->get('JqueryWireTabs'); 
+		
+		/** @var InputfieldForm $form */
+		$form = $modules->get('InputfieldForm');
+		$form->attr('id', 'ProcessLanguageFieldExportImport');
+		$form->attr('enctype', 'multipart/form-data');
+		$form->add($this->buildExportTab());
+		$form->add($this->buildImportTab());
+
+		if($input->post('submit_export')) {
+			$form->getChildByName('tab_export')->processInput($input->post);
+			$this->processExport($form);
+		} else if($input->post('submit_import')) {
+			$form->getChildByName('tab_import')->processInput($input->post);
+			$this->processImport($form);
+		} else {
+			$this->cleanupFiles();
+		}
+	
+		$out = $form->render();
+		
+		$out .= "
+			<$js>
+				$('#ProcessLanguageFieldExportImport').WireTabs({
+					items: $('.Inputfields li.WireTab'),
+					id: 'ProcessLanguageFieldExportImportTabs'
+				});
+			</$js>
+		";
+		
+		return $out;
+	}
+	
+	/*** EXPORT ********************************************************************************/
+	
+	/**
+	 * Build the “export” tab
+	 *
+	 * @return InputfieldWrapper
+	 *
+	 */
+	protected function buildExportTab() {
+
+		$modules = $this->wire()->modules;
+		$languages = $this->wire()->languages;
+		$fields = $this->wire()->fields;
+		
+		$fieldOptions = array();
+		foreach($this->exporter()->getInstalledLanguageTypes() as $className) {
+			foreach($fields as $field) {
+				/** @var Field $field */
+				if(wireInstanceOf($field->type->className(), $className)) {
+					$fieldOptions[$field->name] = $field->name;
+				}
+			}
+		}
+		
+		ksort($fieldOptions);
+
+		/** @var InputfieldWrapper $form */
+		$form = $this->wire(new InputfieldWrapper());
+		$form->attr('id+name', 'tab_export');
+		$form->attr('title', $this->_('Export'));
+		$form->addClass('WireTab');
+		
+		/** @var InputfieldSelect $f */
+		$f = $modules->get('InputfieldSelect');
+		$f->attr('name', 'source_language');
+		$f->label = $this->_('Source language');
+		$f->description = $this->_('Language the translator will read from.'); 
+		$f->required = true;
+		$f->columnWidth = 50;
+		foreach($languages as $language) {
+			$f->addOption($language->id, "$language->name ($language->title)");
+		}
+		$f->val($languages->getDefault()->id);
+		$form->add($f);
+
+		/** @var InputfieldSelect $f */
+		$f = $modules->get('InputfieldSelect');
+		$f->attr('name', 'target_language');
+		$f->label = $this->_('Target language');
+		$f->description = $this->_('Language the translator will translate to.'); 
+		$f->required = true;
+		$f->columnWidth = 50;
+		foreach($languages as $language) {
+			$f->addOption($language->id, "$language->name ($language->title)");
+		}
+		$form->add($f);
+		
+		/** @var InputfieldCheckboxes $f */
+		$f = $modules->get('InputfieldCheckboxes');
+		$f->attr('name', 'limit_fields');
+		$f->label = $this->_('Fields to export');
+		$f->description = $this->_('If *no* fields are checked then ALL known multi-language fields on each page will be exported. If *any* fields are checked then ONLY those fields will be exported.');
+		$f->addOptions($fieldOptions);
+		$f->optionWidth = 350;
+		$f->collapsed = Inputfield::collapsedBlank;
+		$form->add($f);
+
+		/** @var InputfieldSelector $f */
+		$f = $modules->get('InputfieldSelector');
+		$f->attr('name', 'selector');
+		$f->label = $this->_('Pages to export');
+		$f->value = "template=, include=unpublished";
+		$form->add($f);
+
+		/** @var InputfieldRadios $f */
+		$f = $modules->get('InputfieldRadios');
+		$f->attr('name', 'format');
+		$f->label = $this->_('Export format');
+		$f->addOption('json-file', 'JSON file download');
+		$f->addOption('json-text', 'JSON text for copy/paste');
+		$f->addOption('csv-file', 'CSV file download');
+		$f->addOption('csv-text', 'CSV text for copy/paste');
+		$f->val('json-file');
+		$f->columnWidth = 50;
+		$form->add($f);
+		
+		/** @var InputfieldRadios $f */
+		$f = $modules->get('InputfieldCheckboxes');
+		$f->attr('name', 'exportOptions');
+		$f->label = $this->_('Export options');
+		$f->addOption('omitTranslated', $this->_('Omit already translated rows'));
+		$f->addOption('compact', $this->_('Use compact export (omits hierarchy indicators)'));
+		// $f->addOption('includeBlank', 'Include rows where source value is blank');
+		$f->addOption('sourceToTarget', $this->_('Repeat source value in target when not yet translated'));
+		if($this->clientKey === 'updateag') {
+			$f->addOption('sourceToTarget2', $this->_('Repeat source value in target always'));
+		}
+		$f->columnWidth = 50;
+		$form->add($f);
+
+		/** @var InputfieldSubmit $f */
+		$f = $modules->get('InputfieldSubmit');
+		$f->attr('name', 'submit_export');
+		$f->val($this->_('Export'));
+		$form->add($f);
+
+		return $form;
+	}
+	
+	/**
+	 * Process primary export form
+	 *
+	 * @param InputfieldForm $form
+	 *
+	 */
+	protected function processExport(InputfieldForm $form) {
+
+		$modules = $this->wire()->modules;
+		$languages = $this->wire()->languages;
+		$jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES;
+		$exporter = $this->exporter();
+
+		if(defined('JSON_UNESCAPED_LINE_TERMINATORS')) $jsonFlags |= JSON_UNESCAPED_LINE_TERMINATORS;
+
+		$selectorInput = $form->getChildByName('selector');
+		$selector = $selectorInput->val();
+		if(empty($selector)) {
+			$selectorInput->error($this->_('No selector defined'));
+			return;
+		}
+
+		$sourceLanguageInput = $form->getChildByName('source_language');
+		$sourceLanguageId = (int) $sourceLanguageInput->val();
+		$sourceLanguage = $sourceLanguageId ? $languages->get($sourceLanguageId) : null;
+		if(!$sourceLanguage || !$sourceLanguage->id) {
+			$sourceLanguageInput->error($this->_('No language selected'));
+			return;
+		}
+
+		$targetLanguageInput = $form->getChildByName('target_language');
+		$targetLanguageId = (int) $targetLanguageInput->val();
+		$targetLanguage = $targetLanguageId ? $languages->get($targetLanguageId) : null;
+		if(!$targetLanguage || !$targetLanguage->id) {
+			$targetLanguageInput->error($this->_('No language selected'));
+			return;
+		}
+
+		$pageIds = $this->wire()->pages->findIDs($selector, array(
+			'allowCustom' => true, 
+		));
+		if(!count($pageIds)) {
+			$selectorInput->error($this->_('No pages found'));
+			return;
+		}
+
+		$limitFields = $form->getChildByName('limit_fields')->val();
+		$exporter->setLimitFields($limitFields);
+
+		$options = $form->getChildByName('exportOptions')->val();
+		
+		$exporter->omitTranslated = in_array('omitTranslated', $options);
+		$exporter->compact = in_array('compact', $options);
+		
+		if(in_array('sourceToTarget2', $options)) {
+			$exporter->sourceToTarget = 2; // always
+		} else if(in_array('sourceToTarget', $options)) {
+			$exporter->sourceToTarget = true; // only if target value is blank
+		} else {
+			$exporter->sourceToTarget = false;
+		}
+		
+		$format = $form->getChildByName('format')->val();
+
+		$data = $exporter->exportPages($pageIds, $sourceLanguage, $targetLanguage);
+		if(empty($data)) return;
+
+		if($format === 'json-file' || $format === 'csv-file' || $format === 'csv-text') {
+			list($ext,) = explode('-', $format);
+			$file = $this->getDownloadFilename($sourceLanguage, $targetLanguage, $ext);
+			if($format === 'json-file') {
+				$this->wire()->files->filePutContents($file, json_encode($data, $jsonFlags));
+			} else if(isset($data['items'][0])) {
+				$fp = fopen($file, 'w');
+				$header = $data['items'][0];
+				foreach($header as $key => $value) $header[$key] = $key;
+				$header['source'] = "$sourceLanguage->name ($sourceLanguage->title)";
+				$header['target'] = "$targetLanguage->name ($targetLanguage->title)";
+				fputcsv($fp, array_values($header));
+				foreach($data['items'] as $row) {
+					fputcsv($fp, array_values($row));
+				}
+				fclose($fp);
+			}
+			unset($data);
+			if($format == 'csv-text') {
+				// CSV text
+				/** @var InputfieldTextarea $f */
+				$f = $modules->get('InputfieldTextarea');
+				$f->attr('name', 'export_csv');
+				$f->label = $this->_('Export CSV data');
+				if(is_file($file)) $f->val(file_get_contents($file));
+				$f->themeColor = 'primary';
+				$tab = $form->getChildByName('tab_export');
+				$tab->prepend($f);
+				if(is_file($file)) unlink($file);
+			} else {
+				// JSON or CSV file download
+				$http = new WireHttp();
+				$http->sendFile($file, array('exit' => false));
+				unlink($file);
+				exit;
+			}
+
+		} else {
+			// JSON text
+			/** @var InputfieldTextarea $f */
+			$f = $modules->get('InputfieldTextarea');
+			$f->attr('name', 'export_json');
+			$f->label = $this->_('Export JSON data');
+			$f->val(json_encode($data, $jsonFlags));
+			$f->themeColor = 'primary';
+			$tab = $form->getChildByName('tab_export');
+			$tab->prepend($f);
+		}
+	}
+
+	/*** IMPORT STEP 1 *************************************************************************/
+
+	/**
+	 * Build the “import” tab
+	 *
+	 * @return InputfieldWrapper
+	 *
+	 */
+	protected function buildImportTab() {
+
+		$modules = $this->wire()->modules;
+
+		/** @var InputfieldWrapper $form */
+		$form = $this->wire(new InputfieldWrapper());
+		$form->attr('id+name', 'tab_import');
+		$form->attr('title', $this->_('Import'));
+		$form->addClass('WireTab');
+	
+		/** @var InputfieldTextarea $f */
+		$f = $modules->get('InputfieldTextarea');
+		$f->attr('name', 'import_string');
+		$f->label = $this->_('Import from JSON or CSV string'); 
+		$f->collapsed = Inputfield::collapsedBlank;
+		$f->icon = 'paste';
+		$form->add($f);
+		
+		/** @var InputfieldFile $f */
+		$f = $modules->get('InputfieldFile');
+		$f->name = 'import_file';
+		$f->label = $this->_('Import from JSON or CSV file upload');
+		$f->extensions = 'json csv';
+		$f->icon = 'upload';
+		$f->maxFiles = 1;
+		$f->unzip = 0;
+		$f->overwrite = false;
+		$f->setMaxFilesize('10g');
+		$f->collapsed = Inputfield::collapsedBlank;
+		$f->destinationPath = $this->getFilesPath();
+		$form->add($f);
+	
+		/** @var InputfieldSubmit $f */
+		$f = $modules->get('InputfieldSubmit');
+		$f->attr('name', 'submit_import');
+		$f->val($this->_('Continue'));
+		$form->add($f);
+		
+		return $form;
+	}
+	
+	/**
+	 * Process primary import form
+	 *
+	 * @param InputfieldForm $form
+	 *
+	 */
+	protected function processImport(InputfieldForm $form) {
+
+		$session = $this->wire()->session;
+		$importer = $this->importer();
+		$importData = $form->getChildByName('import_string')->val();
+		$fileField = $form->getChildByName('import_file');
+		$importFile = $fileField->val()->first(); /** @var Pagefile $importFile */
+		$isJSON = true;
+
+		if($importFile) {
+			$importFile = $importFile->filename;
+			$exists = $importFile && is_file($importFile);
+			if($exists) {
+				$ext = strtolower(pathinfo($importFile, PATHINFO_EXTENSION)); 
+				if($ext === 'json') {
+					$importData = file_get_contents($importFile);
+				} else if($ext === 'csv') {
+					$importData = $this->processCsvFileToArray($importFile);
+					$importFile = '';
+					$isJSON = false;
+				}
+			}
+			$fileField->value = null;
+			
+		} else if(strpos($importData, 'page,') === 0) {
+			// CSV string data
+			$importData = $this->processCsvStringToArray($importData);
+			$isJSON = false;
+			
+		} else if(strpos($importData, '{') === 0) {
+			// JSON string data
+		}
+
+		if(empty($importData)) {
+			$this->error($this->_('No import data provided'));
+			return;
+		}
+
+		if($isJSON) {
+			$importData = json_decode($importData, true);
+			if(empty($importData)) {
+				$this->error($this->_('Unable to decode JSON'));
+				return;
+			}
+		}
+
+		if(!$importer->isValidImportData($importData)) {
+			// error message reported by above method call
+			return;
+		}
+
+		if(!$importFile && $importData) {
+			// write import data to file
+			do {
+				$importFile = $this->wire()->page->filesManager()->path() . mt_rand() . '.json';
+			} while(is_file($importFile));
+			file_put_contents($importFile, json_encode($importData));
+		}
+
+		$pageIds = array();
+
+		foreach($importData['items'] as $item) {
+			if(ctype_digit("$item[page]")) {
+				$pageId = (int) $item['page'];
+			} else if(strpos($item['page'], '>')) {
+				$a = explode('>', $item['page']);
+				$pageId = (int) trim(array_pop($a));
+			} else {
+				continue;
+			}
+			$pageIds[$pageId] = $pageId;
+		}
+
+		$numPages = count($pageIds);
+		$numRows = count($importData['items']);
+
+		if(!$numPages) {
+			$this->error('No pages found');
+			return;
+		}
+
+		$templateIds = array();
+		$templateCounts = array();
+		$sql = "SELECT templates_id FROM pages WHERE id IN(" . implode(',', $pageIds) . ")";
+		$query = $this->wire()->database->prepare($sql);
+		$query->execute();
+		
+		while($row = $query->fetch(\PDO::FETCH_NUM)) {
+			$templateId = (int) $row[0];
+			$templateIds[$templateId] = $templateId;
+			if(!isset($templateCounts[$templateId])) $templateCounts[$templateId] = 0;
+			$templateCounts[$templateId]++;
+		}
+		
+		$query->closeCursor();
+
+		$session->setFor($this, 'importFile', $importFile);
+		$session->setFor($this, 'importFields', array_keys($importData['fields']));
+		$session->setFor($this, 'importTemplateIds', array_values($templateIds));
+		$session->setFor($this, 'importTemplateCounts', $templateCounts);
+		$session->setFor($this, 'importNumPages', $numPages);
+		$session->setFor($this, 'importNumRows', $numRows);
+		
+		$this->message("Found $numRows translation rows(s) for $numPages page(s)", Notice::noGroup); 
+		
+		$session->redirect('./import2/');
+	}
+
+	/**
+	 * Convert CSV file to data array
+	 * 
+	 * @param string $file
+	 * @return array
+	 * 
+	 */
+	protected function processCsvFileToArray($file) {
+		$fields = $this->wire()->fields;
+		
+		$fp = fopen($file, 'r');
+		if($fp === false) return array();
+		
+		$data = array(
+			'source_language' => '', 
+			'target_language' => '', 
+			'version' => 2, 
+			'exported' => date('Y-m-d H:i:s', filemtime($file)), 
+			'fields' => array(), 
+			'items' => array(), 
+		);
+		
+		$n = 0;
+		
+		while(false !== ($row = fgetcsv($fp))) {
+			if(++$n === 1) {
+				$data['source_language'] = $row[3];
+				$data['target_language'] = $row[4];
+				continue;
+			}
+			$fieldName = $row[1];
+			$item = array(
+				'page' => (int) $row[0], 
+				'field' => $fieldName, 
+				'type' => $row[2], 
+				'source' => $row[3],
+				'target' => $row[4],
+			);
+			$data['items'][] = $item;
+			if(!isset($data['fields'][$fieldName])) {
+				$field = $fields->get($fieldName);
+				$data['fields'][$fieldName] = ($field ? $field->type->className() : '');
+			}
+		}
+		
+		return $data;
+	}
+
+	/**
+	 * Convert CSV string to data array
+	 *
+	 * @param string $str
+	 * @return array
+	 *
+	 */
+	protected function processCsvStringToArray($str) {
+		$fields = $this->wire()->fields;
+		$data = array(
+			'source_language' => '',
+			'target_language' => '',
+			'version' => 2,
+			'exported' => date('Y-m-d H:i:s'),
+			'fields' => array(),
+			'items' => array(),
+		);
+
+		$n = 0;
+		foreach(explode("\n", $str) as $line) {
+			$row = str_getcsv($line);
+			if(++$n === 1) {
+				$data['source_language'] = $row[3];
+				$data['target_language'] = $row[4];
+				continue;
+			}
+			$fieldName = $row[1];
+			$item = array(
+				'page' => (int) $row[0], 'field' => $fieldName, 'type' => $row[2], 
+				'source' => $row[3], 'target' => $row[4]
+			);
+			$data['items'][] = $item;
+			if(!isset($data['fields'][$fieldName])) {
+				$field = $fields->get($fieldName);
+				$data['fields'][$fieldName] = ($field ? $field->type->className() : '');
+			}
+		}
+		
+		return $data;
+	}
+	
+
+	/*** IMPORT STEP 2 *************************************************************************/
+	
+	public function executeImport2() {
+
+		$input = $this->wire()->input;
+		$form = $this->buildImport2();
+		
+		$this->headline($this->_('Import step 2')); 
+
+		if($input->post('submit_import')) {
+			$form->processInput($input->post);
+			if(count($form->getErrors())) return $form->render();
+			$this->processImport2($form);
+		}
+		
+		return $form->render();
+	}
+
+	/**
+	 * @return InputfieldForm
+	 * 
+	 */
+	protected function buildImport2() {
+	
+		$session = $this->wire()->session;
+		$templates = $this->wire()->templates;
+		$modules = $this->wire()->modules;
+		
+		$importFile = $session->getFor($this, 'importFile'); /** @var string $importFile */
+		// $importFields = $session->getFor($this, 'importFields'); /** @var array $importFields */
+		$importTemplateIds = $session->getFor($this, 'importTemplateIds'); /** @var array $importTemplateIds */
+		$importTemplateCounts = $session->getFor($this, 'importTemplateCounts'); /** @var array $importTemplateCounts */
+		$importNumPages = (int) $session->getFor($this, 'importNumPages');
+		$importNumRows = (int) $session->getFor($this, 'importNumRows'); 
+		
+		$templateIdsByName = array();
+		foreach($importTemplateIds as $templateId) {
+			$template = $templates->get((int) $templateId);
+			if($template) $templateIdsByName[$template->name] = (int) $templateId;
+		}
+		
+		if(empty($importFile) || !is_file($importFile)) {
+			$this->error("No import file found");
+			$session->redirect('../');
+		}
+		
+		/** @var InputfieldForm $form */
+		$form = $modules->get('InputfieldForm');
+		$form->attr('action', $this->wire()->page->url . 'import2/'); 
+		$form->attr('id+name', 'tab_import');
+		$form->prependMarkup = 
+			'<h2>' . 
+			sprintf($this->_n('%d page', '%d pages', $importNumPages), $importNumPages) . ' - ' . 
+			sprintf($this->_n('%d translation', '%d translations', $importNumRows), $importNumRows) . 
+			'</h2>';
+
+		/** @var InputfieldCheckboxes $f */
+		/*
+		$f = $modules->get('InputfieldCheckboxes');
+		$f->attr('name', 'import_fields');
+		$f->label = $this->_('Select fields to import (or select none to import all)');
+		foreach($importFields as $importField) {
+			$f->addOption($importField);
+		}
+		$form->add($f);
+		*/
+		
+		/** @var InputfieldCheckboxes $f */
+		$f = $modules->get('InputfieldCheckboxes');
+		$f->attr('name', 'import_templates');
+		$f->label = $this->_('Select pages to import by template (or select none to import all)');
+		foreach($templateIdsByName as $templateName => $templateId) {
+			$template = $templates->get($templateName);
+			$label = $template ? $template->getLabel() : $templateName;
+			if(isset($importTemplateCounts[$templateId])) {
+				$n = (int) $importTemplateCounts[$templateId];
+				$label .= ' [span.detail] ' . sprintf($this->_n('(%d page)', '(%d pages)', $n), $n) . ' [/span] ';
+			}
+			$f->addOption($templateId, $label);
+		}
+		$form->add($f);
+
+		/** @var InputfieldCheckboxes $f */
+		$f = $modules->get('InputfieldCheckboxes');
+		$f->name = 'import_options';
+		$f->label = $this->_('Import options');
+		$f->addOption('overwrite', $this->_('Overwrite already translated field values?'));
+		$f->addOption('confirmSource', $this->_('Confirm that source value has not changed before importing?'));
+		$f->addOption('verbose', $this->_('Show verbose debug notifications?'));
+		$f->addOption('testMode', $this->_('Test import without committing changes?'));
+		/*
+		$f->addOption('unentities', $this->_('Decode entities in non-markup values?') . ' ¹');
+		$notes = '¹ ' . $this->_('If translator added entity encoding to plain text values, such as %1$s rather than %2$s, you should check this box.');
+		$notes = str_replace(array('%1$s', '%2$s'), array('<code>&amp;amp;</code>', '<code>&amp;</code>'), $notes);
+		$f->appendMarkup .= "<p class='notes'>$notes</p>";
+		*/
+		$form->add($f);
+		
+		/** @var InputfieldSubmit $f */
+		$f = $modules->get('InputfieldSubmit');
+		$f->attr('name', 'submit_import');
+		$f->val($this->_('Import'));
+		$form->add($f);
+		
+		return $form;
+	}
+
+	/**
+	 * Process primary import form (step 2)
+	 *
+	 * @param InputfieldForm $form
+	 *
+	 */
+	protected function processImport2(InputfieldForm $form) {
+
+		$session = $this->wire()->session;
+		$importer = $this->importer();
+		
+		$importFile = $session->getFor($this, 'importFile');
+		if(!$importFile || !is_file($importFile)) {
+			$this->error("Cannot find import file: $importFile"); 
+			return;
+		}
+		
+		$importData = file_get_contents($importFile);
+		$importData = json_decode($importData, true);
+
+		if(!$importer->isValidImportData($importData)) {
+			// error message reported by above method call
+			return;
+		}
+		
+		$fieldsInput = $form->getChildByName('import_fields'); 
+		$templatesInput = $form->getChildByName('import_templates');
+		$optionsInput = $form->getChildByName('import_options');
+		$optionValues = $optionsInput->val();
+		
+		$options = array(
+			'overwrite' => in_array('overwrite', $optionValues),
+			'confirmSource' => in_array('confirmSource', $optionValues),
+			'verbose' => in_array('verbose', $optionValues),
+			'fields' => ($fieldsInput ? $fieldsInput->val() : array()),
+			'templateIds' => ($templatesInput ? $templatesInput->val() : array()), 
+			'testMode' => in_array('testMode', $optionValues), 
+		);
+
+		$importer->import($importData, $options);
+	}
+
+	/***********************************************************************/
+
+	/**
+	 * Get download filename
+	 * 
+	 * @param Language $sourceLanguage
+	 * @param Language $targetLanguage
+	 * @param string $ext
+	 * @return string
+	 * 
+	 */
+	protected function getDownloadFilename(Language $sourceLanguage, Language $targetLanguage, $ext = 'json') {
+		$pathname = $this->getFilesPath() . "$sourceLanguage->name-$targetLanguage->name.$ext";
+		$file = $pathname;
+		$n = 0;
+		while(is_file($file) && ++$n) {
+			$file = str_replace(".$ext", "-$n.$ext", $pathname);
+		}
+		return $file;
+	}
+	
+	/**
+	 * Get files disk path for upload/download
+	 *
+	 * @return string
+	 *
+	 */
+	protected function getFilesPath() {
+		$page = $this->wire()->page;
+		return $page->filesManager()->path();
+	}
+
+	/**
+	 * Cleanup leftover download files
+	 * 
+	 */
+	protected function cleanupFiles() {
+		$files = $this->wire()->files;
+		$path = $this->getFilesPath();
+		if(!is_dir($path)) return;
+		foreach(new \DirectoryIterator($path) as $file) {
+			if($file->isDot() || $file->isDir()) continue;
+			$ext = strtolower($file->getExtension());
+			if($ext !== 'json' && $ext !== 'csv') continue;
+			if($file->getMTime() > (time()-3600)) continue;
+			$this->message("Removed old download file: " . $file->getBasename());
+			$files->unlink($file->getPathname());
+		}
+	}
+
+	/**
+	 * @param string $key
+	 * @param mixed $value
+	 * @return self|Process
+	 * 
+	 */
+	public function set($key, $value) {
+		if($key === 'clientKey') $value = strtolower($value);
+		return parent::set($key, $value);
+	}
+
+	/**
+	 * Module config
+	 * 
+	 * @param InputfieldWrapper $inputfields
+	 * 
+	 */
+	public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+		$modules = $this->wire()->modules;
+		/** @var InputfieldText $f */
+		$f = $modules->get('InputfieldText');
+		$f->attr('name', 'clientKey'); 
+		$f->label = 'Client key';
+		$f->notes = $this->_('Leave this blank unless instructed by the developer to enter something here.'); 
+		$f->collapsed = Inputfield::collapsedBlank;
+		$f->val($this->clientKey);
+		$inputfields->add($f);
+	}
+}
